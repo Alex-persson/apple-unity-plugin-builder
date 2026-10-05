@@ -1,0 +1,153 @@
+name: Build Apple Unity Plugins
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      XCODE_XCCONFIG_FILE: ${{ github.workspace }}/plugin-build.xcconfig
+    steps:
+      - name: Fetch pinned Apple release 27.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: apple/unityplugins
+          ref: ffe61740e2fad5015948b14d41dbc0486664aed0
+          path: apple
+          persist-credentials: false
+
+      - name: Check toolchain and configure library signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk macosx --show-sdk-version
+          python3 --version
+          npm --version
+          cat > "$XCODE_XCCONFIG_FILE" <<'CONFIG'
+          CODE_SIGNING_ALLOWED = NO
+          CONFIG
+
+      - name: Guard Apple native initialization on other platforms
+        working-directory: apple
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          guard = '#if UNITY_EDITOR_OSX || (!UNITY_EDITOR && (UNITY_IOS || UNITY_TVOS || UNITY_STANDALONE_OSX || UNITY_VISIONOS))'
+          core = Path('plug-ins/Apple.Core/Apple.Core_Unity/Assets/Apple.Core')
+          gamekit = Path('plug-ins/Apple.GameKit/Apple.GameKit_Unity/Assets/Apple.GameKit')
+
+          def guard_bodies(path, signature, expected):
+              text = path.read_text(encoding='utf-8')
+              matches = list(re.finditer(re.escape(signature), text))
+              if len(matches) != expected:
+                  raise RuntimeError(f'{path}: expected {expected} occurrences of {signature}')
+              for match in reversed(matches):
+                  start = text.index('{', match.end())
+                  depth = 1
+                  end = start + 1
+                  while depth:
+                      if text[end] == '{':
+                          depth += 1
+                      elif text[end] == '}':
+                          depth -= 1
+                      end += 1
+                  end -= 1
+                  body = text[start + 1:end].rstrip()
+                  text = text[:start + 1] + '\n' + guard + body + '\n#endif\n        ' + text[end:]
+              path.write_text(text, encoding='utf-8')
+
+          guard_bodies(core / 'Runtime/Availability.cs', 'private static void OnApplicationStart()', 1)
+          guard_bodies(gamekit / 'Source/DefaultHandlers.cs', 'public static void Init()', 2)
+          guard_bodies(gamekit / 'Source/GKGameActivity.cs', 'static GKGameActivity()', 1)
+          PY
+
+      - name: Build Core and GameKit libraries and packages
+        working-directory: apple
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/shell/*.sh
+          python3 build.py -p Core GameKit -m iOS macOS -bc Release -c - < /dev/null
+
+      - name: Verify native binaries and record build details
+        working-directory: apple
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import hashlib
+          import json
+          import subprocess
+          import tarfile
+
+          expected = {
+              'com.apple.unityplugin.core': ('3.3.0', 'AppleCoreNative'),
+              'com.apple.unityplugin.gamekit': ('4.1.0', 'GameKitWrapper'),
+          }
+          magic = {b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'}
+          packages = sorted(Path('Build').glob('*.tgz'))
+          if len(packages) != 2:
+              raise RuntimeError(f'Expected two packages, found {len(packages)}')
+          found = set()
+          records = []
+          for package in packages:
+              with tarfile.open(package, 'r:gz') as archive:
+                  metadata = json.load(archive.extractfile('package/package.json'))
+                  name = metadata['name']
+                  version, binary_name = expected[name]
+                  if name in found or metadata['version'] != version:
+                      raise RuntimeError(f'Unexpected package metadata: {metadata}')
+                  found.add(name)
+                  for platform in ('iOS', 'macOS'):
+                      candidates = [member for member in archive.getmembers()
+                                    if member.isfile() and PurePosixPath(member.name).name == binary_name
+                                    and f'/NativeLibraries~/Release/{platform}/' in member.name
+                                    and '.dSYM/' not in member.name]
+                      if not candidates:
+                          raise RuntimeError(f'{name}: missing {platform} binary')
+                      for member in candidates:
+                          with archive.extractfile(member) as binary:
+                              if member.size < 4096 or binary.read(4) not in magic:
+                                  raise RuntimeError(f'Invalid native binary: {member.name}')
+                      print(f'Verified {name} {platform} binary')
+                  if name.endswith('gamekit') and metadata['dependencies'].get('com.apple.unityplugin.core') != '3.3.0':
+                      raise RuntimeError('Unexpected Apple.Core dependency')
+              records.append({'file': package.name, 'sha256': hashlib.sha256(package.read_bytes()).hexdigest()})
+          if found != set(expected):
+              raise RuntimeError('A required package is missing')
+          record = {
+              'apple_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'xcode': subprocess.check_output(['xcodebuild', '-version'], text=True).strip(),
+              'configuration': 'Release',
+              'platforms': ['iOS', 'macOS'],
+              'modification': 'Managed native-initialization guards for non-Apple platforms',
+              'packages': records,
+          }
+          Path('Build/build-details.json').write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
+          PY
+          git diff -- plug-ins/Apple.Core/Apple.Core_Unity/Assets/Apple.Core/Runtime/Availability.cs plug-ins/Apple.GameKit/Apple.GameKit_Unity/Assets/Apple.GameKit/Source/DefaultHandlers.cs plug-ins/Apple.GameKit/Apple.GameKit_Unity/Assets/Apple.GameKit/Source/GKGameActivity.cs > Build/platform-guards.patch
+
+      - name: Upload Unity packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: apple-unity-plugins
+          path: |
+            apple/Build/*.tgz
+            apple/Build/build-details.json
+            apple/Build/platform-guards.patch
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
