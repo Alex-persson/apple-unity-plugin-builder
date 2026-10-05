@@ -96,6 +96,8 @@ jobs:
           expected = {
               'com.apple.unityplugin.core': ('3.3.0', 'AppleCoreNative'),
               'com.apple.unityplugin.gamekit': ('4.1.0', 'GameKitWrapper'),
+              'com.apple.unityplugin.core': ('3.3.0', {'iOS': 'AppleCoreNative', 'macOS': 'AppleCoreNativeMac'}),
+              'com.apple.unityplugin.gamekit': ('4.1.0', {'iOS': 'GameKitWrapper', 'macOS': 'GameKitWrapper'}),
           }
           magic = {b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'}
           packages = sorted(Path('Build').glob('*.tgz'))
@@ -108,16 +110,22 @@ jobs:
                   metadata = json.load(archive.extractfile('package/package.json'))
                   name = metadata['name']
                   version, binary_name = expected[name]
+                  version, binary_names = expected[name]
                   if name in found or metadata['version'] != version:
                       raise RuntimeError(f'Unexpected package metadata: {metadata}')
                   found.add(name)
                   for platform in ('iOS', 'macOS'):
+                      binary_name = binary_names[platform]
                       candidates = [member for member in archive.getmembers()
                                     if member.isfile() and PurePosixPath(member.name).name == binary_name
                                     and f'/NativeLibraries~/Release/{platform}/' in member.name
                                     and '.dSYM/' not in member.name]
                       if not candidates:
+                          paths = [member.name for member in archive.getmembers()
+                                   if f'/NativeLibraries~/Release/{platform}/' in member.name
+                                   and '.dSYM/' not in member.name and member.isfile()]
                           raise RuntimeError(f'{name}: missing {platform} binary')
+                          raise RuntimeError(f'{name}: missing {platform} binary {binary_name}; found: {paths}')
                       for member in candidates:
                           with archive.extractfile(member) as binary:
                               if member.size < 4096 or binary.read(4) not in magic:
